@@ -3,44 +3,107 @@ from fastapi.middleware.cors import CORSMiddleware
 import os
 import requests
 import json
-from anthropic import Anthropic
+import boto3
 from openai import OpenAI
 from dotenv import load_dotenv
 
+# -------------------------------
 # Load environment variables
+# -------------------------------
 load_dotenv(dotenv_path=".env.local")
 openai_key = os.getenv("OPENAI_API_KEY")
-anthropic_key = os.getenv("ANTHROPIC_API_KEY")
 
 # Initialize clients
 openaiclient = OpenAI(api_key=openai_key)
-claudeclient = Anthropic(api_key=anthropic_key)
+# Initialize AWS Bedrock client
+bedrock_runtime = boto3.client(
+    service_name='bedrock-runtime',
+    region_name=os.getenv("AWS_REGION", "us-east-1")  # Add AWS_REGION to your .env.local
+)
 
 ALLOWED_TABLE = os.getenv("ALLOWED_TABLE", "agentic_program_data")
 DEFAULT_MAX_ROWS = int(os.getenv("DEFAULT_MAX_ROWS", "1000"))
-
-# FastAPI setup
-app = FastAPI()
 N8N_WEBHOOK_URL = "http://localhost:5678/webhook-test/agentic-sql"
+
+# -------------------------------
+# Database Schema Explanation
+# -------------------------------
+DB_SCHEMA_EXPLANATION = """
+# Database Field Definitions for Supply Chain and Forecasting Expert
+
+- PROGRAM_NAME: Name of the Program (e.g., Country + Health Area + Organisation)
+- PROGRAM_CODE: Program code (same context as PROGRAM_NAME)
+- COUNTRY_CODE: 3-digit ISO Country Code
+- COUNTRY: Name of the Country
+- HEALTH_AREA: Name of Health/Technical Area
+- HEALTH_AREA_CODE: 3–10 digit code of Health Area
+- ORGANISATION_CODE: Organisation Code
+- ORGANISATION_NAME: Organisation Name
+- PLANNING_UNIT_NAME: Name of Planning Unit (Product/SKU)
+- FORECASTING_UNIT_NAME: Name of Forecasting Unit
+- PLANNING_UNIT_ID: Unique ID for the Planning Unit
+- REORDER_FREQUENCY_IN_MONTHS: Months between shipments
+- MIN_MONTHS_OF_STOCK: Minimum months of stock
+- LOCAL_PROCUREMENT_LEAD_TIME: Lead time for local procurement
+- SHELF_LIFE: Shelf life of product (months)
+- CATALOG_PRICE: Unit catalog price
+- MONTHS_IN_FUTURE_FOR_AMC: Look-ahead months for Average Monthly Consumption
+- MONTHS_IN_PAST_FOR_AMC: Look-back months for AMC
+- DISTRIBUTION_LEAD_TIME: Time between receipt and lowest-level distribution
+- FORECAST_ERROR_THRESHOLD: Acceptable forecast error margin
+- TRANS_DATE: Month for which record applies
+- AMC: Average Monthly Consumption (demand measure)
+- AMC_COUNT: Months used to calculate AMC
+- MOS: Months of Stock available
+- MIN_STOCK_QTY: Minimum stock quantity (safety stock)
+- MIN_STOCK_MOS: Minimum months of stock
+- MAX_STOCK_QTY: Maximum stock quantity
+- MAX_STOCK_MOS: Maximum months of stock
+- OPENING_BALANCE: Beginning stock for period
+- SHIPMENT_QTY: Quantity of shipment expected this month
+- FORECASTED_CONSUMPTION_QTY: Expected consumption
+- ACTUAL_CONSUMPTION_QTY: Actual historical consumption
+- EXPIRED_STOCK: Stock expired during this month
+- CLOSING_BALANCE: Ending stock level
+- UNMET_DEMAND: Unfulfilled demand due to stockouts
+- PLAN_BASED_ON: Whether plan is based on QTY or MOS
+- VERSION_STATUS: Version status (Pending Approval, Approved, etc.)
+- VERSION_TYPE: Version type (Draft, Final)
+"""
+
+# -------------------------------
+# FastAPI setup
+# -------------------------------
+app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, restrict this
+    allow_origins=["*"],  # Restrict in production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+
 def extract_json_from_markdown(text: str) -> str:
     """Remove markdown code blocks from JSON response"""
     text = text.strip()
-    if text.startswith("```json"):
-        text = text[7:]
-    elif text.startswith("```"):
-        text = text[3:]
+    # Remove a leading code fence (``` or ```lang) if present
+    if text.startswith("```"):
+        # If there's a newline after the opening fence, remove everything up to that newline
+        newline_idx = text.find("\n")
+        if newline_idx != -1:
+            text = text[newline_idx + 1 :]
+        else:
+            # No newline, just remove the three backticks
+            text = text[3:]
+
+    # Remove a trailing closing fence if present
     if text.endswith("```"):
-        text = text[:-3]
+        text = text[:-3].rstrip()
+
     return text.strip()
+
 
 @app.post("/generate-dashboard")
 async def generate_dashboard(req: Request):
@@ -57,71 +120,75 @@ async def generate_dashboard(req: Request):
         messages=[
             {
                 "role": "system",
-                "content": (
-                    "You are a Database expert. You have been provided with access to a table `agentic_program_data`. The database version is MySQL 8.0.43. "
-                    "This table contains Supply Plan information for different Country Health Care Programs from around the world.  Each Program consists of Planning Units or Products. Data is provided for different Months for each Planning Unit. The DB_SCHEMA_EXPLANATION gives you an explanation of what each field is for. Use only these fields when referring to the table."
-                    "Each Program consists of Planning Units or Products. Data is provided for different Months for each Planning Unit. "
-                    "The DB_SCHEMA_EXPLANATION gives you an explanation of what each field is for. Use only these fields when referring to the table.\n\n"
-                    "DB_SCHEMA_EXPLANATION = '# Database Field Definitions for Supply Chain and Forecasting Expert ### "
-                    "- PROGRAM_NAME - Name of the Program. Generally combination of Country, Health Area and Organisation."
-                    "-PROGRAM_CODE - Code of the Program. Generally combination of Country. Health Area and Organisation."
-                    "- COUNTRY_CODE - 3 digit Code of the Country."
-                    "-COUNTRY - Name of the Country."
-                    "-HEALTH_AREA - Name of Health Area/Technical Area"
-                    "-HEALTH_AREA_CODE - 3 to 10 digit code of Health Area/Technical Area."
-                    "-ORGANISATION_CODE - Name of Organisation"
-                    "-ORGANISATION_NAME - 3 to 10 digit code of Organisation."
-                    "-PLANNING_UNIT - Name of the Planning Unit (product/SKU)."
-                    "- FORECASTING_UNIT_NAME: Name of the Forecasting Unit. "
-                    "- PLANNING_UNIT_ID: Id for the Planning Unit. "
-                    "- REORDER_FREQUENCY_IN_MONTHS - Reorder level settings for this Planning Unit and Program (reorder cycle) i.e How many months between shipments? "
-                    "- MIN_MONTHS_OF_STOCK: Minimum MoS setting. "
-                    "-MIN_MONTHS_OF_STOCK - Minimum MoS settings for this Planning Unit and Program."
-                    "-LOCAL_PROCUREMENT_LEAD_TIME - Local Procurement Lead Time for shipments to be procured if procured by local procurement agent"
-                    "-SHELF_LIFE - Shelf Life of the product in months"
-                    "- CATALOG_PRICE: Price of the product."
-                    "- MONTHS_IN_FUTURE_FOR_AMC: Look-ahead period for Average Monthly Consumption calculation. Including current month."
-                    "- MONTHS_IN_PAST_FOR_AMC: Look-back period for AMC (Average Monthly Consumption calculation)."
-                    "- DISTRIBUTION_LEAD_TIME: How many months does it take between shipment receipt and the product to be distributed down to the lowest level? Used for suggested shipments ahead of understock. "
-                    "- FORECAST_ERROR_THRESHOLD: Threshold for forecast error. "
-                    #"- TRANS_DATE - Month for which this record is for (temporal dimension)."
-                    "- MONTH: Month for which this record is for (temporal dimension). "
-                    "- AMC: Average Monthly Consumption calculated and stored for this Month (a measure of baseline demand). "
-                    "- AMC_COUNT: Number of months of data used for AMC (Average Monthly Consumption calculation). "
-                    "- MOS: Months of Stock available for this Product (Inventory health metric). 0 indicates Out of Stock, Below Min MOS indicates under stock, Above Max MOS (Min Mos + Reorder Level) indicates overstock, Between Min MOS and Max MOS indicates Adaqute stock. "
-                    "- MIN_STOCK_QTY: Minimum Stock Quantity (safety stock in units). Any value below this indicates an undersupply risk. "
-                    "- MIN_STOCK_MOS: Minimum Months of Stock (safety stock in time). Any value below this indicates an undersupply risk. "
-                    "- MAX_STOCK_QTY: Maximum Stock Quantity (inventory ceiling in units). Any value above this indicates an oversupply/obsolescence risk."
-                    "- MAX_STOCK_MOS: Maximum Months of Stock (inventory ceiling in time). Any value above this indicates an oversupply/obsolescence risk."
-                    "- OPENING_BALANCE: Beginning stock level for the period. "
-                    "- SHIPMENT_QTY: Quantity of Shipment expected to be received in this month (inbound supply). "
-                    "- FORECASTED_CONSUMPTION_QTY: Future expected demand. "
-                    "- ACTUAL_CONSUMPTION_QTY: Actual historical demand. "
-                    "- EXPIRED_STOCK: Amount of Stock that Expired this month (a measure of waste/obsolescence)."
-                    "- CLOSING_BALANCE: Ending stock level for the period."
-                    "- UNMET_DEMAND: Amount of demand that was there but was Unmet due to a stock-out. Occurs when the closing balance is '0' and part of consumption was unmet, or when adjusted consumption accounts for days stocked out. Unmet demand can also happen when a negative manual adjustment is larger than the projected ending balance."
-                    "-PLAN_BASED_ON - Should minimum and maximum inventory parameters be based on QTY or months of stock (MOS)? Most products are better planned by MOS, while some low consumption, higher expiry products are better planned by quantity."
-                    "PLANNING_UNIT_ID - Id for the Planning Unit."
-                    "-VERSION_STATUS - Version Status Desc (Pending Approval, Approved, Needs Revision, No Review Needed)"
-                    "-VERSION_TYPE - Version Type Desc (Draft Version, Final Version)"
-                    "VERSION_ID - Version Id"
-                    "Below are the formulas that can be used 1) Forecast Error is calculated using the Weighted Absolute Percentage Error (WAPE). WAPE is used over MAPE (Mean Absolute Percentage Error) as it can account for when consumption is intermittent or low. 2) The WAPE formula uses the previous 3-12 months of data depending on the selection in the Time Window dropdown. For example, if the ‘Time Window’ selected is 6 months, then 6 months of actual consumption and 6 months of forecasted consumption is used"
-        
-                    "Users will write out prompts in simple English, your job is to generate a single **safe MySQL SELECT statement** which will pull the relevant data from the provided table based on these prompts. "
+            "content": (
+                "You are a MySQL 8.0.43 expert. Generate SELECT queries for table `agentic_program_data` containing supply chain data.\n\n"
+                "# Available Columns (USE ONLY THESE):\n"
+                "PROGRAM_NAME, PROGRAM_CODE, COUNTRY_CODE, COUNTRY, HEALTH_AREA, HEALTH_AREA_CODE, "
+                "ORGANISATION_CODE, ORGANISATION_NAME, PLANNING_UNIT_NAME, FORECASTING_UNIT_NAME, "
+                "PLANNING_UNIT_ID, REORDER_FREQUENCY_IN_MONTHS, MIN_MONTHS_OF_STOCK, "
+                "LOCAL_PROCUREMENT_LEAD_TIME, SHELF_LIFE, CATALOG_PRICE, MONTHS_IN_FUTURE_FOR_AMC, "
+                "MONTHS_IN_PAST_FOR_AMC, DISTRIBUTION_LEAD_TIME, FORECAST_ERROR_THRESHOLD, "
+                "TRANS_DATE, AMC, AMC_COUNT, MOS, MIN_STOCK_QTY, MIN_STOCK_MOS, "
+                "MAX_STOCK_QTY, MAX_STOCK_MOS, OPENING_BALANCE, SHIPMENT_QTY, "
+                "FORECASTED_CONSUMPTION_QTY, ACTUAL_CONSUMPTION_QTY, EXPIRED_STOCK, "
+                "CLOSING_BALANCE, UNMET_DEMAND, PLAN_BASED_ON, VERSION_STATUS, VERSION_TYPE, VERSION_ID\n\n"
+                "# IMPORTANT Column Name Clarifications:\n"
+                "- For minimum months of stock threshold → Use: MIN_STOCK_MOS\n"
+                "- For maximum months of stock threshold → Use: MAX_STOCK_MOS\n"
+                "- For minimum months of stock setting → Use: MIN_MONTHS_OF_STOCK\n"
+                "- For current months of stock value → Use: MOS\n"
+                "- For projected expiry → Use: EXPIRED_STOCK\n\n"
 
-                    "Create queries that can be used in mysql 8.0.4 database. In case you have both code and name for something like organisation code and name then try matching with code and name both and if possible use fuzzy match for matching in where conditions. "
-                    "You should generate a complex sql query using GROUP BY ORDER BY etc, in case the user prompt intents for a report "
-                    "If version status is not specified do not add that in the where clause." 
-                    "If version Type is not specified then do not add that in the where clause. "
-                    "Give direct results and related columns do not only intermediate columns or final columns."
-                    "Be careful of the version that is asked in the prompt. For latest version use data that is there for max version Id. If no version is specified use latest version"
-                    "generate a query which will show the month wise records for that product. "
-                    "Mandatory : Always output only the SQL query, without explanations or extra text and without any markdown code blocks. "
+                "# Field Descriptions:\n"
+                "- PROGRAM_CODE: Program identifier (Country-HealthArea-Org format)\n"
+                "- PLANNING_UNIT_ID: Product/SKU identifier\n"
+                "- PLANNING_UNIT_NAME: Product/SKU name\n"
+                "- TRANS_DATE: Transaction month (DATE type)\n"
+                "- MOS: Months of Stock available - current inventory health metric\n"
+                "- MIN_STOCK_MOS: Minimum MoS threshold (use this column, NOT 'MIN_MONTHS_OF_STOCK')\n"
+                "- MAX_STOCK_MOS: Maximum MoS threshold (use this column, NOT 'MAX_MONTHS_OF_STOCK')\n"
+                "- MIN_MONTHS_OF_STOCK: Minimum MoS setting from program configuration\n"
+                "- CLOSING_BALANCE: Ending inventory quantity\n"
+                "- OPENING_BALANCE: Starting inventory quantity\n"
+                "- SHIPMENT_QTY: Incoming shipment quantity\n"
+                "- ACTUAL_CONSUMPTION_QTY: Historical demand\n"
+                "- FORECASTED_CONSUMPTION_QTY: Projected demand\n"
+                "- EXPIRED_STOCK: Quantity expired (this is 'projected expiry' in user language)\n"
+                "- UNMET_DEMAND: Stockout quantity\n"
+                "- AMC: Average Monthly Consumption\n"
+                "- VERSION_ID: Data version (higher = newer)\n"
+                "- VERSION_STATUS: Approval status\n"
+                "- VERSION_TYPE: 'Draft Version' or 'Final Version'\n\n"
+
+                "# Query Rules:\n"
+                "1. Output ONLY the SQL query - no markdown, no explanations\n"
+                "2. Use fuzzy matching (LIKE 'value') for PROGRAM_CODE and text fields\n"
+                "3. Match on both CODE and NAME fields when available\n"
+                "4. For 'latest version' without type specification:\n"
+                "   WHERE VERSION_ID = (SELECT MAX(VERSION_ID) FROM agentic_program_data WHERE PROGRAM_CODE LIKE 'XXX')\n"
+                "5. For 'latest draft' or 'latest final', include VERSION_TYPE in both outer query and subquery:\n"
+                "   WHERE VERSION_ID = (SELECT MAX(VERSION_ID) FROM agentic_program_data WHERE PROGRAM_CODE LIKE 'XXX' AND VERSION_TYPE = 'Draft Version')\n"
+                "6. Do NOT filter VERSION_STATUS unless user explicitly mentions approval status\n"
+                "7. For date ranges: TRANS_DATE BETWEEN 'YYYY-MM-DD' AND 'YYYY-MM-DD'\n"
+                "8. To determine stock status using CASE statements, use these EXACT column names:\n"
+                "   CASE \n"
+                "     WHEN MOS = 0 THEN 'Out of Stock'\n"
+                "     WHEN MOS < MIN_STOCK_MOS THEN 'Understock'\n"
+                "     WHEN MOS > MAX_STOCK_MOS THEN 'Overstock'\n"
+                "     ELSE 'Adequate Stock'\n"
+                "   END AS stock_status\n"
+                "   NOTE: Use MIN_STOCK_MOS and MAX_STOCK_MOS (not MIN_MONTHS_OF_STOCK or MAX_MONTHS_OF_STOCK)\n"
+                "9. Always include relevant columns for the analysis, use GROUP BY/ORDER BY for reports\n"
+                "10. When user asks for 'consumption, inventory and shipment data', include:\n"
+                "    ACTUAL_CONSUMPTION_QTY, FORECASTED_CONSUMPTION_QTY, OPENING_BALANCE, CLOSING_BALANCE, SHIPMENT_QTY\n"
+                "11. NEVER use columns not in the Available Columns list above"
+
                 )
             },
             {"role": "user", "content": prompt}
         ]
     )
+
     sql_query = sql_resp.choices[0].message.content.strip()
     print(f"Generated SQL: {sql_query}")
 
@@ -134,59 +201,63 @@ async def generate_dashboard(req: Request):
     print(f"N8N response data: {data}")
 
     # -------------------------------
-    # Step 3: Analyze data using Claude
+    # Step 3: Analyze data using Claude via AWS Bedrock
     # -------------------------------
-    analysis = claudeclient.messages.create(
-        # model="claude-sonnet-4-20250514",
-        model="claude-sonnet-4-20250514",
-        max_tokens=4000,  # ✅ More tokens for detailed analysis
-        system=(
-            "You are a world-class **Forecasting & Supply Planning Expert** with deep knowledge of production planning, "
-            "demand forecasting, inventory optimization, and supply chain analytics. "
-            "You are analyzing data extracted from a MySQL table that contains historical data for Planning units from specific programs.\n\n"
-            f"The prompt asked by the user is: {prompt}\n\n. You job is to analyze the data and provide insights to the user query.Keep your answer short and precise.\n\n"
-            "Think step-by-step like a supply chain planning consultant, not a generic analyst. "
-            "Respond to the user prompt query with a precise answer by using the attached dataset.\n\n"
-            "CRITICAL: You MUST respond with ONLY a valid JSON object. "
-            "Do NOT wrap your response in markdown code blocks (```json or ```). "
-            "Do NOT include any explanatory text before or after the JSON.\n\n"
-            "The JSON must have this exact structure:\n"
-            "{\n"
-            '  "requestType": "1-Simple English" or "2-Data Table" or "3-Visualization",\n'
-            '  "data": "..." or [...],  // either simple english string or data table array\n'
-            '  "visualization": "...",  // description of visualization for the data\n'
-            '  "answer": "..."  // detailed analysis of the visualized data\n'
-            "}\n\n"
-            f"Here is the dataset to analyze:\n{json.dumps(data, indent=2)}"
-        ),
-        messages=[
-            {"role": "user", "content": f"Analyze this dataset and respond with JSON only:\n\n{json.dumps(data, indent=2)}"}
-        ]
+    system_prompt = (
+        "You are a world-class Forecasting & Supply Planning Expert with deep knowledge of production planning, "
+        "demand forecasting, inventory optimization, and supply chain analytics. "
+        f"The user prompt is: {prompt}\n\n"
+        "Analyze the provided dataset and respond concisely.\n"
+        "Think step-by-step like a planning consultant.\n\n"
+        "You MUST respond with a valid JSON object only:\n"
+        "{\n"
+        '  "requestType": "1-Simple English" or "2-Data Table" or "3-Visualization",\n'
+        '  "data": "..." or [...],\n'
+        '  "visualization": "...",\n'
+        '  "answer": "..."\n'
+        "}"
     )
-    
-    print(f"Claude analysis response: {analysis}")
-    
-    # ✅ Extract and parse JSON response
-    analysis_response = analysis.content[0].text.strip()
+
+    # Prepare request body for Bedrock
+    bedrock_body = json.dumps({
+        "anthropic_version": "bedrock-2023-05-31",
+        "max_tokens": 4000,
+        "system": system_prompt,
+        "messages": [
+            {
+                "role": "user",
+                "content": f"Analyze this dataset and respond in JSON only:\n{json.dumps(data, indent=2)}"
+            }
+        ]
+    })
+
+    # Invoke Claude via Bedrock
+    bedrock_response = bedrock_runtime.invoke_model(
+        modelId="us.anthropic.claude-3-5-sonnet-20241022-v2:0",
+        body=bedrock_body
+    )
+
+    # Parse response
+    response_body = json.loads(bedrock_response['body'].read())
+    analysis_response = response_body['content'][0]['text'].strip()
     cleaned_analysis = extract_json_from_markdown(analysis_response)
-    
+
     try:
         parsed_analysis = json.loads(cleaned_analysis)
     except json.JSONDecodeError as e:
         print(f"Failed to parse JSON: {e}")
-        print(f"Raw analysis response: {analysis_response}")
-        # Return a default structure if parsing fails
         parsed_analysis = {
             "requestType": "1-Simple English",
             "data": "Error parsing analysis response",
             "visualization": "",
             "answer": analysis_response
         }
-    
-    # ✅ Step 4: Return SQL + result + analysis back to frontend/CLI
+
+    # -------------------------------
+    # Step 4: Return SQL + result + analysis
+    # -------------------------------
     return {
-        "query": sql_query, 
+        "query": sql_query,
         "data": data,
         "analysis": parsed_analysis
     }
-
