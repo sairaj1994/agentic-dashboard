@@ -435,7 +435,7 @@ async def generate_dashboard(req: Request):
     '    ],\n'
     '    "recommendations": [\n'
     '      {\n'
-    '        "type": "immediate" | "short-term" | "medium-term" | "insight",\n'
+    '        "type": "immediate" | "short-term" | "medium-term" | "strategic" | "insight",\n'
     '        "title": "Section title",\n'
     '        "items": ["Recommendation 1", "Recommendation 2"]\n'
     '      }\n'
@@ -447,7 +447,7 @@ async def generate_dashboard(req: Request):
     "# Guidelines for Each Section:\n"
     "summaryCards: Create 3-5 key metrics. Status: success(good), warning(attention), error(critical), info(neutral)\n"
     "charts: Include 1-3 charts. Use TRANS_DATE for xAxis in time-series. Series dataKey must match actual column names.\n"
-    "recommendations: Only include if user asks for advice. Group by urgency: immediate, short-term, medium-term\n"
+    "recommendations: Only include if user asks for advice. Group by urgency: immediate, short-term, medium-term, strategic, insight\n"
     "answer: Clear narrative explaining data, key findings, and answers to user's question with specific numbers\n\n"
     
     "# Color Guide:\n"
